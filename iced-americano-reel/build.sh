@@ -33,6 +33,6 @@ fi
 node scripts/render.mjs --workers "$WORKERS"
 ffmpeg -y -v error -framerate 30 -i build/frames/f_%05d.jpg -i build/audio/mix.wav \
 	-af "loudnorm=I=-14:TP=-1.0:LRA=9" -ar 48000 \
-	-c:v libx264 -preset slow -crf 18 -profile:v high -pix_fmt yuv420p -movflags +faststart \
+	-c:v libx264 -preset slow -crf 21 -tune film -profile:v high -pix_fmt yuv420p -movflags +faststart \
 	-c:a aac -b:a 192k -shortest output/iced_americano_reel.mp4
 echo "output/iced_americano_reel.mp4"
