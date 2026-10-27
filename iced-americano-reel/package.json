@@ -1,0 +1,16 @@
+{
+  "name": "iced-americano-reel",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "3D reels-style video: how to make an iced americano (three.js + procedural SFX + Korean TTS)",
+  "scripts": {
+    "render": "node scripts/render.mjs"
+  },
+  "dependencies": {
+    "@fontsource/noto-sans-kr": "^5.1.0",
+    "@pmndrs/assets": "^1.7.0",
+    "cannon-es": "^0.20.0",
+    "three": "^0.170.0"
+  }
+}
