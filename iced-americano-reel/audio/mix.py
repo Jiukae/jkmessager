@@ -14,6 +14,8 @@ import numpy as np
 import soundfile as sf
 from scipy import signal
 
+import sfx as sfx_mod
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 B = os.path.join(ROOT, "build")
 OUT = os.path.join(B, "audio")
@@ -54,7 +56,7 @@ def place(bus, sig, t, gain=1.0, pan=0.0):
 
 
 def bp(x, lo, hi, order=2):
-    return signal.sosfilt(signal.butter(order, [lo, hi], "bandpass", fs=SR, output="sos"), x)
+    return signal.sosfilt(signal.butter(order, [lo, hi], "bandpass", fs=SR, output="sos"), x, axis=0)
 
 
 def lp(x, f, order=2):
@@ -93,220 +95,155 @@ def level(t):
     return np.where(np.asarray(t) < W["t0"], BASE, lv)
 
 
+def air_column(lv):
+    """Quarter-wave resonance of the air above the liquid (with end correction)."""
+    return 343 / (4 * (H - lv + 2.3) / 100)
+
+
+WALLA_LINES = [
+    "오늘 날씨 진짜 좋다", "이거 생각보다 맛있네", "주말에 뭐 할 거야", "아 그래서 어떻게 됐어",
+    "라떼 한 잔 더 시킬까", "여기 분위기 괜찮다", "케이크도 하나 시키자", "그 얘기 들었어",
+    "완전 웃기지 않아", "나 요즘 운동 시작했어", "회의가 너무 길었어", "다음에 또 오자",
+]
+
+
+def make_walla():
+    """Café murmur: overlapping far-away speakers made with the offline voice, then
+    pitch-varied, band-limited and pushed back into the room until no word is legible."""
+    cache = os.path.join(OUT, "walla.wav")
+    if os.path.exists(cache):
+        x, _ = sf.read(cache)
+        return np.pad(x, ((0, max(0, N - len(x))), (0, 0)))[:N]
+    model = os.path.join(B, "models", "vits-mimic3-ko_KO-kss_low")
+    if not os.path.isdir(model):
+        return None
+    import sherpa_onnx
+    vits = sherpa_onnx.OfflineTtsVitsModelConfig(model=f"{model}/ko_KO-kss_low.onnx", tokens=f"{model}/tokens.txt", data_dir=f"{model}/espeak-ng-data")
+    tts = sherpa_onnx.OfflineTts(sherpa_onnx.OfflineTtsConfig(model=sherpa_onnx.OfflineTtsModelConfig(vits=vits, num_threads=4)))
+    clips = []
+    for text in WALLA_LINES:
+        a = tts.generate(text, sid=0, speed=1.1)
+        clips.append(signal.resample_poly(np.asarray(a.samples), SR, a.sample_rate))
+    out = np.zeros((N, 2))
+    for spk in range(6):
+        pitch = rng.uniform(0.72, 1.12)  # <1 lowers the voice: several "people"
+        pan = rng.uniform(-0.9, 0.9)
+        t = rng.uniform(0, 1.5)
+        while t < DUR:
+            c = clips[rng.integers(len(clips))]
+            c = signal.resample(c, int(len(c) / pitch))
+            i = int(t * SR)
+            n = min(len(c), N - i)
+            if n <= 0:
+                break
+            a = (pan + 1) * np.pi / 4
+            out[i:i + n, 0] += c[:n] * np.cos(a) * rng.uniform(0.5, 1.0)
+            out[i:i + n, 1] += c[:n] * np.sin(a) * rng.uniform(0.5, 1.0)
+            t += len(c) / SR + rng.uniform(0.3, 1.6)
+    out = bp(out, 220, 2200)
+    out = np.stack([signal.fftconvolve(out[:, c], sfx_mod.room_ir(0.9, 4000)[:, c])[:N] for c in range(2)], 1) * 0.5 + out * 0.15
+    out /= np.max(np.abs(out)) + 1e-9
+    os.makedirs(OUT, exist_ok=True)
+    sf.write(cache, out.astype(np.float32), SR)
+    return out
+
+
 def visible_main(t):
     """1 while the glass is on screen (the espresso scene cuts to the machine)."""
     e = S["espresso"]
     return 0.0 if e["start"] + 0.05 < t < e["end"] - 0.05 else 1.0
 
 
-# ---------------------------------------------------------------- sources
-
-def damped(freqs, decays, amps, length, phase=True):
-    t = tvec(int(length * SR))
-    out = np.zeros_like(t)
-    for f, d, a in zip(freqs, decays, amps):
-        ph = rng.uniform(0, 2 * np.pi) if phase else 0
-        out += a * np.sin(2 * np.pi * f * t + ph) * np.exp(-t / d)
-    return out
-
-
-def click(length=0.004, lo=2000, hi=12000):
-    n = int(length * SR)
-    x = rng.standard_normal(n) * np.exp(-np.arange(n) / (n / 4))
-    return bp(np.concatenate([x, np.zeros(256)]), lo, min(hi, SR / 2 - 100))
-
-
-def glass_clink(v, fill, under):
-    """Ice hitting the tumbler: inharmonic shell modes, lower + deader when full."""
-    amp = min(1.0, (v / 160) ** 0.85)
-    f0 = 1240 * (1 - 0.32 * fill) * rng.uniform(0.97, 1.03)
-    damp = 1 - 0.6 * fill
-    s = damped([f0, f0 * 2.71, f0 * 5.13, f0 * 8.3], [0.42 * damp, 0.2 * damp, 0.09 * damp, 0.04 * damp], [1, 0.6, 0.32, 0.14], 1.0)
-    s[: 8] *= np.linspace(0, 1, 8)
-    tick = damped(rng.uniform(2800, 5600, 2), [0.012, 0.02], [0.5, 0.35], 0.06)
-    s[: len(tick)] += tick
-    c = click(0.003)
-    s[: len(c)] += c * 0.6
-    if under:
-        s = lp(s, 1300) * 0.35
-    return s * amp
-
-
-def ice_tick(v, under, plastic=False):
-    amp = min(1.0, (v / 130) ** 0.85)
-    if plastic:
-        s = damped(rng.uniform(1100, 2300, 2), [0.018, 0.012], [0.6, 0.4], 0.08)
-    else:
-        s = damped(rng.uniform(2300, 5600, 3), rng.uniform(0.012, 0.035, 3), [0.6, 0.45, 0.3], 0.12)
-        c = click(0.002, 3000)
-        s[: len(c)] += c * 0.5
-    if under:
-        s = lp(s, 900) * 0.4
-    return s * amp
-
-
-def bubble(f, amp, rising=0.12):
-    d = 0.043 * f + 0.0014 * f ** 1.5
-    n = int(min(5.5 / d, 0.12) * SR)
-    t = tvec(n)
-    inst = f * (1 + rising * d * t)
-    return amp * np.sin(2 * np.pi * np.cumsum(inst) / SR) * np.exp(-d * t)
-
-
-def bubbles(bus, t0, t1, rate_fn, per_sec, fmin, fmax, gain, pan=0.0):
-    """Liquid noise as a cloud of Minnaert bubbles, density following rate_fn(t)."""
-    t = t0
-    while t < t1:
-        t += rng.exponential(1 / per_sec)
-        r = float(rate_fn(t))
-        if rng.random() > r:
-            continue
-        f = np.exp(rng.uniform(np.log(fmin), np.log(fmax)))
-        a = (fmin / f) ** 0.6 * rng.uniform(0.3, 1.0)
-        place(bus, bubble(f, a), t, gain, pan + rng.uniform(-0.15, 0.15))
-
-
-def resonant_noise(t0, t1, rate_fn, freq_fn, q, lo=300, hi=9000):
-    """Pour noise through an air-column resonance whose pitch rises as the glass fills."""
-    n = int((t1 - t0) * SR)
-    t = t0 + tvec(n)
-    x = bp(rng.standard_normal(n), lo, hi)
-    flutter = 1 + 0.5 * bp(rng.standard_normal(n), 6, 30, 1) * 8
-    x *= np.clip(flutter, 0.2, 2.0) * rate_fn(t)
-    out = np.zeros(n)
-    blk = 256
-    zi = np.zeros(2)
-    for i in range(0, n, blk):
-        f = float(freq_fn(t[i]))
-        b, a = signal.iirpeak(min(f, 8000), q, fs=SR)
-        out[i:i + blk], zi = signal.lfilter(b, a, x[i:i + blk], zi=zi)
-    return out, x
-
-
-def air_column(lv):
-    """Quarter-wave resonance of the air above the liquid (with end correction)."""
-    L = (H - lv + 2.3) / 100
-    return 343 / (4 * L)
-
-
 # ---------------------------------------------------------------- SFX bus
 
+sfx_mod.seed(1234)
 sfx = buf()
+water_pan, pour_pan = 0.28, 0.25  # both the carafe and the shot glass come in from the right
 
-# physics contacts -> clinks
+# physics contacts -> impacts (the first cubes land on the glass foot)
+first_glass = True
 for e in ev["events"]:
     t = e["t"]
-    vis = visible_main(t)
-    if vis == 0:
+    if visible_main(t) == 0:
         continue
     fill = float(np.clip((e["level"] - BASE) / (H - BASE), 0, 1)) if e["level"] > 0 else 0.0
-    pan = float(np.clip(rng.normal(0, 0.18), -0.5, 0.5))
+    pan = float(np.clip(rng.normal(0, 0.16), -0.45, 0.45))
     if e["kind"] == "glass":
-        place(sfx, glass_clink(e["v"], fill, e["under"]), t, 0.5, pan)
+        low = e["y"] < 3.5
+        place(sfx, sfx_mod.glass_hit(e["v"], fill, e["under"], low=low), t, 0.55, pan)
     elif e["kind"] == "straw":
-        place(sfx, ice_tick(e["v"], e["under"], plastic=True), t, 0.35, pan)
+        place(sfx, sfx_mod.straw_hit(e["v"], e["under"]), t, 0.4, pan)
     else:
-        place(sfx, ice_tick(e["v"], e["under"]), t, 0.32, pan)
+        place(sfx, sfx_mod.ice_hit(e["v"], e["under"]), t, 0.34, pan)
 
-# hero shots: a few lazy clinks of settling ice
+# hero shots: lazy clinks of settling ice in a full glass
 for t, v in ((0.75, 45), (2.3, 30), (3.85, 38), (S["outro"]["start"] + 0.9, 40), (S["outro"]["start"] + 2.6, 28)):
-    place(sfx, glass_clink(v, 0.85, False), t, 0.38, rng.uniform(-0.2, 0.2))
-    place(sfx, ice_tick(v * 0.8, False), t + 0.05, 0.2)
+    place(sfx, sfx_mod.glass_hit(v, 0.85, False), t, 0.4, rng.uniform(-0.2, 0.2))
+    place(sfx, sfx_mod.ice_hit(v * 0.7, False), t + rng.uniform(0.03, 0.08), 0.22, rng.uniform(-0.2, 0.2))
 
-# water pour: bubbles + rising air-column resonance + splash on the ice
+column = lambda tt: air_column(float(level(tt)))
+
+# cold water from the carafe
 w_rate = lambda t: flow_rate(t, W["t0"], W["t1"], 0.35)
-bubbles(sfx, W["t0"], W["t1"] + 0.3, w_rate, 1400, 650, 4800, 0.11, 0.15)
-res, raw = resonant_noise(W["t0"], W["t1"] + 0.3, w_rate, lambda t: air_column(float(level(t))), 6)
-place(sfx, res * 0.09 + hp(raw, 2500) * 0.02, W["t0"], 1.0, 0.1)
-for _ in range(14):  # bobbing ice nudging the glass while the water churns
-    t = rng.uniform(W["t0"] + 0.5, W["t1"])
-    place(sfx, glass_clink(rng.uniform(15, 35), float((level(t) - BASE) / (H - BASE)), True), t, 0.4)
+place(sfx, sfx_mod.pour(W["t0"], W["t1"], w_rate, column, stream=1.0), W["t0"], 0.27, water_pan)
+for _ in range(16):  # floating cubes nudging each other and the glass while the water churns
+    t = rng.uniform(W["t0"] + 0.4, W["t1"] + 0.6)
+    f = float((level(t) - BASE) / (H - BASE))
+    hit = sfx_mod.glass_hit(rng.uniform(15, 40), f, True) if rng.random() < 0.5 else sfx_mod.ice_hit(rng.uniform(20, 60), rng.random() < 0.6)
+    place(sfx, hit, t, 0.4, rng.uniform(-0.25, 0.35))
+place(sfx, sfx_mod.crackle(2.5, lambda tt: 10 * np.exp(-tt / 1.0) + 1), W["t0"] + 0.2, 0.25, water_pan)
 
 # espresso machine
 E = cues["espresso"]
 e0, e1 = E["pumpOn"], E["pumpOff"]
-n = int((e1 - e0 + 0.15) * SR)
-t = tvec(n)
-fpump = 50 - 3 * smoothstep(0, 1.6, t)
-ph = 2 * np.pi * np.cumsum(fpump) / SR
-pulse = np.maximum(np.sin(ph), 0) ** 3
-pump = lp(pulse - pulse.mean(), 1800, 4) * 1.0 + lp(rng.standard_normal(n) * pulse, 3000) * 0.18
-pump += 0.4 * np.sin(ph) * smoothstep(0, 0.4, t)
-pump *= smoothstep(0, 0.05, t) * (1 - smoothstep(len(t) / SR - 0.2, len(t) / SR, t)) * (0.7 + 0.3 * smoothstep(0.3, 1.8, t))
-place(sfx, pump, e0, 0.22, -0.1)
-for tc in (e0, e1):
-    place(sfx, damped([180, 1450, 3200], [0.025, 0.012, 0.006], [1, 0.5, 0.3], 0.1) + np.pad(click(0.003, 1500), (0, 4800))[:4800], tc, 0.35)
-hiss = bp(rng.standard_normal(int(0.6 * SR)), 1500, 7000) * np.exp(-tvec(int(0.6 * SR)) / 0.16)
-place(sfx, hiss, e1 + 0.03, 0.08, 0.15)
+place(sfx, sfx_mod.rocker_click(), e0 - 0.16, 0.28, -0.15)
+place(sfx, sfx_mod.solenoid(), e0, 0.25, -0.05)
+place(sfx, sfx_mod.vibratory_pump(e1 - e0), e0, 0.1, -0.1)
+place(sfx, sfx_mod.solenoid(release=True), e1, 0.28, 0.1)
+place(sfx, sfx_mod.rocker_click(), e1 - 0.05, 0.22, -0.15)
+shot_col = lambda tt: 343 / (4 * (6.5 - 0.7 - 2.35 * float(flow_progress(tt, E["flow0"] - 0.2, E["flow1"] + 0.2, 0.5)) + 1.6) / 100)
 fl = lambda t: flow_rate(t, E["flow0"], E["flow1"], 0.5)
-bubbles(sfx, E["flow0"], E["flow1"] + 0.2, fl, 700, 1800, 6500, 0.045)
+place(sfx, sfx_mod.pour(E["flow0"], E["flow1"], fl, shot_col, stream=0.35, tail_drips=0), E["flow0"], 0.07)
 drip_times = list(np.arange(E["drip0"], E["flow0"] + 0.2, 0.21)) + list(np.arange(E["flow1"] - 0.1, E["flow1"] + 1.2, 0.26))
 for td in drip_times:
-    place(sfx, bubble(rng.uniform(1300, 2500), 1.0, 0.3), td + rng.uniform(0, 0.04), 0.1, rng.choice([-0.12, 0.12]))
+    place(sfx, sfx_mod.bubble(rng.uniform(1300, 2500), 1.0, 0.4), td + rng.uniform(0, 0.04), 0.1, rng.choice([-0.12, 0.12]))
+n = int((S["espresso"]["end"] - S["espresso"]["start"]) * SR)
+boiler = (np.sin(2 * np.pi * 100 * tvec(n)) * 0.6 + np.sin(2 * np.pi * 200 * tvec(n)) * 0.25 + lp(rng.standard_normal(n), 400) * 0.6)
+boiler *= smoothstep(0, 0.3, tvec(n)) * (1 - smoothstep(n / SR - 0.3, n / SR, tvec(n)))
+place(sfx, boiler, S["espresso"]["start"], 0.02)
 
-# espresso poured over the ice: thinner stream, rising pitch, thermal crackle of the ice
+# espresso over the ice: thinner, darker stream and the ice crackling from the heat
 p_rate = lambda t: flow_rate(t, P["t0"], P["t1"], 0.4)
-bubbles(sfx, P["t0"], P["t1"] + 0.3, p_rate, 900, 900, 5200, 0.12, -0.1)
-res, raw = resonant_noise(P["t0"], P["t1"] + 0.3, p_rate, lambda t: air_column(float(level(t))), 7)
-place(sfx, res * 0.08 + hp(raw, 3000) * 0.012, P["t0"], 1.0, -0.05)
-tc = P["t0"] + 0.25
-while tc < P["t1"] + 3.0:
-    tc += rng.exponential(1 / (32 * np.exp(-(tc - P["t0"]) / 2.2) + 2))
-    place(sfx, damped(rng.uniform(3000, 7500, 2), [0.004, 0.006], [1, 0.6], 0.03), tc, rng.uniform(0.02, 0.09), rng.uniform(-0.3, 0.3))
+place(sfx, sfx_mod.pour(P["t0"], P["t1"], p_rate, column, stream=0.6, tail_drips=6), P["t0"], 0.22, pour_pan)
+place(sfx, sfx_mod.crackle(P["t1"] - P["t0"] + 3.5, lambda tt: 45 * np.exp(-tt / 2.0) + 3), P["t0"] + 0.25, 0.7, 0.05)
 
-# stirring swish
+# stirring
 ST = cues["stir"]
-n = int((ST["s1"] - ST["s0"] + 1.0) * SR)
-t = tvec(n)
-rate = smoothstep(0, 0.35, t) * (1 - smoothstep(ST["s1"] - ST["s0"] - 0.3, ST["s1"] - ST["s0"] + 0.4, t))
-swish = bp(rng.standard_normal(n), 250, 1700) * (0.35 + 0.65 * np.abs(np.sin(np.pi * 0.85 * 2 * t))) * rate
-place(sfx, swish, ST["s0"], 0.08)
-place(sfx, ice_tick(60, False, plastic=True), ST["in1"] - 0.05, 0.3)
+dur = ST["s1"] - ST["s0"] + 1.2
+s_rate = lambda tt: smoothstep(0, 0.35, tt) * (1 - smoothstep(ST["s1"] - ST["s0"] - 0.3, ST["s1"] - ST["s0"] + 0.5, tt))
+place(sfx, sfx_mod.stir_swirl(dur, s_rate, 0.85), ST["s0"], 0.13)
+t_dip = ST["in0"] + (ST["in1"] - ST["in0"]) * 0.45  # straw breaks the surface
+place(sfx, sfx_mod.bubble(520, 1.0, 0.8), t_dip, 0.12)
+place(sfx, sfx_mod.noise_burst(60, 400, 5000), t_dip, 0.05)
+tr = ST["s0"]
+while tr < ST["s1"]:  # extra rattle the coarse contact list misses
+    tr += rng.exponential(1 / 9)
+    under = rng.random() < 0.6
+    hit = sfx_mod.ice_hit(rng.uniform(20, 70), under) if rng.random() < 0.7 else sfx_mod.glass_hit(rng.uniform(15, 45), 0.8, under)
+    place(sfx, hit, tr, 0.3 * float(s_rate(tr - ST["s0"])), rng.uniform(-0.3, 0.3))
 
-# whoosh on every cut
-for i, s in enumerate(tl["scenes"][1:]):
-    n = int(0.55 * SR)
-    t = tvec(n)
-    x = rng.standard_normal(n)
-    env = np.exp(-((t - 0.3) / 0.11) ** 2)
-    out = np.zeros(n)
-    zi = np.zeros(4)
-    for k in range(0, n, 256):
-        fc = 300 + 2600 * np.exp(-((t[k] - 0.3) / 0.12) ** 2)
-        sos = signal.butter(2, [fc * 0.6, min(fc * 1.6, 20000)], "bandpass", fs=SR, output="sos")
-        if k == 0:
-            zi = signal.sosfilt_zi(sos) * 0
-        out[k:k + 256], zi = signal.sosfilt(sos, x[k:k + 256], zi=zi)
-    out *= env
-    d = 1 if (s["step"] % 2) else -1
-    pan = np.clip((t - 0.3) * 4 * d, -0.8, 0.8)
-    st = np.stack([out * np.cos((pan + 1) * np.pi / 4), out * np.sin((pan + 1) * np.pi / 4)], 1)
-    place(sfx, st, s["start"] - 0.3, 0.55)
+# transitions
+for s in tl["scenes"][1:]:
+    place(sfx, sfx_mod.whoosh(1 if s["step"] % 2 else -1), s["start"] - 0.3, 0.4)
 
-# UI: pops for the step badge/tag, sparkle for "완성"
-def pop(f0=520, f1=1300, length=0.07):
-    t = tvec(int(length * SR))
-    f = f0 + (f1 - f0) * (t / length)
-    return np.sin(2 * np.pi * np.cumsum(f) / SR) * np.exp(-t / 0.025)
-
-
-def chime(base):
-    out = np.zeros(int(1.6 * SR))
-    for k, ratio in enumerate((1, 1.26, 1.5, 2.0)):
-        f = base * ratio
-        tone = damped([f, f * 2.76], [0.6, 0.25], [1, 0.25], 1.2)
-        i = int(k * 0.065 * SR)
-        out[i:i + len(tone)] += tone * (0.9 - 0.12 * k)
-    return out
-
-
-place(sfx, pop(380, 900, 0.09), S["hook"]["start"] + 0.06, 0.16)
+# UI: droplet pops for the step badge, ticks for the tag, sparkle for "완성"
+place(sfx, sfx_mod.droplet_pop(420), S["hook"]["start"] + 0.06, 0.16)
 for s in tl["scenes"]:
     if s["step"] > 0:
-        place(sfx, pop(), s["start"] + 0.08, 0.13, -0.3)
-        place(sfx, pop(1500, 2200, 0.035), s["start"] + 0.55, 0.08, -0.4)
-place(sfx, chime(1318.5), S["stir"]["voiceStart"] + S["stir"]["voiceDur"] - 0.6, 0.11)
-place(sfx, chime(1568.0), S["outro"]["start"] + 0.15, 0.14)
+        place(sfx, sfx_mod.droplet_pop(rng.uniform(600, 720)), s["start"] + 0.08, 0.18, -0.3)
+        place(sfx, sfx_mod.soft_tick(), s["start"] + 0.55, 0.1, -0.4)
+place(sfx, sfx_mod.chime(1318.5), S["stir"]["voiceStart"] + S["stir"]["voiceDur"] - 0.6, 0.1)
+place(sfx, sfx_mod.chime(1568.0), S["outro"]["start"] + 0.15, 0.13)
 
 # ---------------------------------------------------------------- ambience
 
@@ -315,14 +252,13 @@ pink = np.cumsum(rng.standard_normal(N)) * 0.002
 pink = hp(pink - np.mean(pink), 60)
 amb[:, 0] += lp(pink, 1800) * 0.25
 amb[:, 1] += lp(np.roll(pink, 4000), 1800) * 0.25
-babble = np.zeros(N)
-for _ in range(7):
-    am = np.clip(lp(rng.standard_normal(N), 5, 1) * 40 + 0.2, 0, 1)
-    babble += bp(rng.standard_normal(N), rng.uniform(250, 500), rng.uniform(1200, 2600)) * am
-amb[:, 0] += babble * 0.012
-amb[:, 1] += np.roll(babble, 9000) * 0.012
-for t in np.arange(1.5, DUR - 1, 4.7):  # far away cups
-    place(amb, lp(glass_clink(rng.uniform(40, 80), 0.6, False), 3000), t + rng.uniform(0, 2), 0.05, rng.uniform(-0.8, 0.8))
+walla = make_walla()
+if walla is not None:
+    amb += walla * 0.05
+for t in np.arange(1.5, DUR - 1, 3.9):  # cups, saucers and spoons around the room
+    kind = rng.random()
+    hit = sfx_mod.glass_hit(rng.uniform(40, 90), 0.3, False) if kind < 0.5 else sfx_mod.straw_hit(rng.uniform(60, 120), False)
+    place(amb, lp(hit, 3500), t + rng.uniform(0, 2), 0.05, rng.uniform(-0.85, 0.85))
 
 # ---------------------------------------------------------------- music (lo-fi)
 
@@ -350,7 +286,7 @@ def epiano(f, length, vel):
 def kick():
     t = tvec(int(0.4 * SR))
     f = 45 + 75 * np.exp(-t / 0.04)
-    return np.sin(2 * np.pi * np.cumsum(f) / SR) * np.exp(-t / 0.22) + np.pad(click(0.002, 1000, 6000), (0, len(t)))[:len(t)] * 0.3
+    return np.sin(2 * np.pi * np.cumsum(f) / SR) * np.exp(-t / 0.22) + np.pad(sfx_mod.noise_burst(2, 1000, 6000), (0, len(t)))[:len(t)] * 0.3
 
 
 def snare():
@@ -421,22 +357,14 @@ for s in tl["scenes"]:
 
 # ---------------------------------------------------------------- spaces + mix
 
-def room_ir(length, decay, bright):
-    t = tvec(int(length * SR))
-    ir = rng.standard_normal((len(t), 2)) * np.exp(-t / decay)[:, None]
-    ir = lp(ir, bright)
-    ir[0] = 0
-    return ir / np.sqrt(np.sum(ir ** 2) / 2)
-
-
 def reverb(x, ir, wet):
     y = np.stack([signal.fftconvolve(x[:, c], ir[:, c])[:N] for c in range(2)], 1)
     return x + y * wet
 
 
-small = room_ir(0.9, 0.18, 6000)
-sfx = reverb(sfx, small, 0.22)
-mus = reverb(mus, room_ir(1.6, 0.35, 5000), 0.18)
+small = sfx_mod.room_ir(0.55, 7000)
+sfx = reverb(sfx, small, 0.16)
+mus = reverb(mus, sfx_mod.room_ir(1.1, 5000, 1.6, early=False), 0.16)
 voice_st = np.stack([voice, voice], 1)
 voice_st = reverb(voice_st, small, 0.04)
 
